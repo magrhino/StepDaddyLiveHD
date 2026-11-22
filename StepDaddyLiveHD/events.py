@@ -72,6 +72,9 @@ _HREF = re.compile(r'\bhref="([^"]*)"')
 _CHANNEL_ID = re.compile(r'(?:/watch\.php\?(?:[^"]*&)?id=|stream-)(\d+)')
 _DAY_DATE = re.compile(r'(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3})[A-Za-z]*\.?\s+(\d{4})')
 _TAGS = re.compile(r'<[^>]+>')
+# A drop bigger than this between consecutive event times in one category is a
+# rollover past midnight; smaller dips (19:15 then 19:00) are just listing order.
+_ROLLOVER_MINUTES = 6 * 60
 _MONTHS = {m: i for i, m in enumerate(
     ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], start=1)}
 
@@ -91,6 +94,15 @@ def _parse_day(title: str) -> datetime | None:
         return datetime(int(m.group(3)), month, int(m.group(1)), tzinfo=SCHEDULE_TZ)
     except ValueError:
         return None
+
+
+_WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+
+def _day_title(dt: datetime) -> str:
+    """A DLHD-style day title for ``dt``, in English whatever the process locale."""
+    month = next(m for m, i in _MONTHS.items() if i == dt.month).capitalize()
+    return f"{_WEEKDAYS[dt.weekday()]} {dt.day:02d} {month} {dt.year} - Schedule Time UK GMT"
 
 
 def _parse_channels(fragment: str) -> tuple[EventChannel, ...]:
@@ -134,6 +146,10 @@ def parse_schedule(page: str) -> list[Event]:
         for cat_chunk in _CAT_SPLIT.split(day_chunk)[1:]:
             cat = _CAT_NAME.search(cat_chunk)
             category = _text(cat.group(1)) if cat else ""
+            # A category lists its events in time order and runs past midnight
+            # under the same day title (e.g. NBA "18:00, 00:30, 01:00"), so a
+            # big step back in time means the next day.
+            prev_minutes, day_offset = None, 0
             for ev_chunk in _EVENT_SPLIT.split(cat_chunk)[1:]:
                 tm = _TIME.search(ev_chunk)
                 title = _TITLE.search(ev_chunk)
@@ -142,12 +158,16 @@ def parse_schedule(page: str) -> list[Event]:
                 hour, minute = int(tm.group(1)), int(tm.group(2))
                 if hour > 23 or minute > 59:
                     continue
+                minutes = hour * 60 + minute
+                if prev_minutes is not None and prev_minutes - minutes > _ROLLOVER_MINUTES:
+                    day_offset += 1
+                prev_minutes = minutes
                 events.append(Event(
                     day=day_title,
                     category=category,
                     time=f"{hour:02d}:{minute:02d}",
                     title=_text(title.group(1)),
-                    start=day_date.replace(hour=hour, minute=minute),
+                    start=day_date.replace(hour=hour, minute=minute) + timedelta(days=day_offset),
                     channels=_parse_channels(ev_chunk),
                 ))
     if not events:
@@ -157,9 +177,20 @@ def parse_schedule(page: str) -> list[Event]:
 
 def legacy_schedule(events: Iterable[Event]) -> dict:
     """Shape events like the old schedule-generated.php JSON the /schedule page reads."""
+    events = list(events)
+    titles: dict = {}  # date -> DLHD's own day title for it
+    for ev in events:
+        listed = _parse_day(ev.day)
+        if listed is not None:
+            titles.setdefault(listed.date(), ev.day)
     days: dict = {}
     for ev in events:
-        days.setdefault(ev.day, {}).setdefault(ev.category, []).append({
+        day = ev.day
+        listed = _parse_day(ev.day)
+        if listed is not None and listed.date() != ev.start.date():
+            # Listed after midnight under the previous day's title.
+            day = titles.get(ev.start.date()) or _day_title(ev.start)
+        days.setdefault(day, {}).setdefault(ev.category, []).append({
             "event": ev.title,
             "time": ev.time,
             "channels": [{"channel_name": c.name, "channel_id": c.id} for c in ev.channels],
@@ -483,6 +514,9 @@ def _programme(channel: str, start: datetime, stop: datetime, ev: Event) -> str:
             f"    <title>{escape(ev.title)}</title>\n"
             f"    <desc>{escape(desc)}</desc>\n"
             f"    <category>{escape(ev.category)}</category>\n"
+            # Every DLHD schedule category is a sport; clients such as Jellyfin
+            # only file programmes under Sports on an exact category match.
+            f"    <category>Sports</category>\n"
             f"  </programme>\n")
 
 
